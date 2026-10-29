@@ -11,6 +11,11 @@ import os
 import re
 import hashlib
 import argparse
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
+from threading import RLock
+from typing import Mapping, Optional, Union
 
 # Add lib to path
 script_dir = os.path.dirname(os.path.realpath(__file__))
@@ -35,11 +40,14 @@ from Logos.Generator import Generator
 # ---------------------------------------------------------------------------
 
 # --- Configuration ---
-CONFIG = {
+DEFAULT_CONFIG = {
     'generator': 'MobileSubstrate',
     'warnings': 'default',
 }
+CONFIG = DEFAULT_CONFIG.copy()
 warnings_count = 0
+_library_mode = False
+_processing_lock = RLock()
 
 # --- File state ---
 filename = None
@@ -62,6 +70,48 @@ last_init_position = []         # [lineno, pos] or empty
 depth_mapping = {"0:0": 0}     # {"line:pos": depth}
 depth = 0
 lineno = 0
+
+
+class LogosError(RuntimeError):
+    """Raised when :func:`preprocess_file` cannot translate a Logos source.
+
+    The command-line interface preserves its traditional diagnostic output and
+    non-zero exit status. The callable API raises this exception instead, so
+    an embedding build system can report errors without catching ``SystemExit``.
+    """
+
+
+def _reset_state(config: Optional[Mapping[str, object]] = None) -> None:
+    """Reset parser globals so each callable invocation is independent."""
+    global CONFIG, warnings_count, filename, preprocessed
+    global line_mapping, lines, patches
+    global groups, current_group, current_class, current_method
+    global new_method_type_encoding, current_function
+    global classes, nesting_stack, first_directive_position, last_init_position
+    global depth_mapping, depth, lineno
+
+    CONFIG = DEFAULT_CONFIG.copy()
+    if config:
+        CONFIG.update({key: str(value) for key, value in config.items()})
+    warnings_count = 0
+    filename = None
+    preprocessed = False
+    line_mapping = {}
+    lines = []
+    patches = []
+    groups = []
+    current_group = None
+    current_class = None
+    current_method = None
+    new_method_type_encoding = None
+    current_function = None
+    classes = {}
+    nesting_stack = []
+    first_directive_position = []
+    last_init_position = []
+    depth_mapping = {"0:0": 0}
+    depth = 0
+    lineno = 0
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -88,7 +138,10 @@ def file_error(curline, reason):
     line_map = lookup_line_mapping(curline)
     fname = line_map[0]
     line_part = str(line_map[1]) + ":" if curline > -1 else ""
-    print(f"{fname}:{line_part} error: {reason}", file=sys.stderr)
+    message = f"{fname}:{line_part} error: {reason}"
+    if _library_mode:
+        raise LogosError(message)
+    print(message, file=sys.stderr)
     sys.exit(1)
 
 
@@ -309,7 +362,59 @@ DIRECTIVE_LOOKAHEAD_RE = re.compile(
 # main
 # ---------------------------------------------------------------------------
 
-def main():
+def preprocess_file(
+    path: Union[str, os.PathLike[str]],
+    config: Optional[Mapping[str, object]] = None,
+) -> str:
+    """Translate one Logos source file and return its generated source.
+
+    This library-friendly alternative to a ``logos.py`` subprocess starts
+    from fresh parser state for every call. Logos warnings retain their normal
+    stderr behavior; fatal translation failures raise :class:`LogosError`.
+
+    Args:
+        path: ``.x`` or ``.xm`` source file to translate.
+        config: Optional overrides such as ``{"generator": "libhooker"}``.
+            Values have the same meaning as CLI ``-c key=value`` options.
+
+    Returns:
+        Generated source, including the leading source line directive.
+
+    Raises:
+        FileNotFoundError: If ``path`` does not exist or cannot be read.
+        LogosError: If Logos encounters an invalid directive or warnings are
+            configured as errors.
+    """
+    source_path = Path(path)
+    try:
+        source_path.read_text()
+    except OSError as exc:
+        raise FileNotFoundError(f"Could not open {source_path}.") from exc
+
+    global _library_mode
+    output = StringIO()
+    # The parser still uses legacy module globals. Serialize public calls so
+    # parallel build workers cannot exchange parser state or captured output.
+    with _processing_lock:
+        _library_mode = True
+        try:
+            with redirect_stdout(output):
+                main(str(source_path), config)
+        finally:
+            _library_mode = False
+    return output.getvalue()
+
+
+def main(
+    source_path: Optional[Union[str, os.PathLike[str]]] = None,
+    config: Optional[Mapping[str, object]] = None,
+):
+    """Run the command-line-compatible processor or process one source path.
+
+    Called without arguments, this preserves the historical CLI behavior.
+    Supplying ``source_path`` is used by :func:`preprocess_file`; output is
+    still written to stdout so existing shell integrations remain compatible.
+    """
     global CONFIG, warnings_count, filename, preprocessed
     global line_mapping, lines, patches
     global groups, current_group, current_class, current_method
@@ -318,34 +423,42 @@ def main():
     global depth_mapping, depth, lineno
 
     script = os.path.basename(__file__)
+    cli_config = {}
 
-    # ---- argument parsing --------------------------------------------------
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('-c', '--config', action='append', default=[])
-    parser.add_argument('-h', '--help', action='store_true', dest='show_help')
-    parser.add_argument('filename', nargs='?')
-    args = parser.parse_args()
+    if source_path is None:
+        # ---- argument parsing --------------------------------------------------
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument('-c', '--config', action='append', default=[])
+        parser.add_argument('-h', '--help', action='store_true', dest='show_help')
+        parser.add_argument('filename', nargs='?')
+        args = parser.parse_args()
 
-    if args.show_help:
-        print(f"Usage: {script} [options] <filename>\n"
-              "Options:\n"
-              "  [-c|--config]\t\tModify Logos' configuration "
-              "(MobileSubstrate, default)\n"
-              "     -c generator=[internal|libhooker|MobileSubstrate]\n"
-              "     -c warnings=[default|error|none]\n"
-              "  [-h|--help]\t\tDisplay this page")
-        sys.exit(0)
+        if args.show_help:
+            print(f"Usage: {script} [options] <filename>\n"
+                  "Options:\n"
+                  "  [-c|--config]\t\tModify Logos' configuration "
+                  "(MobileSubstrate, default)\n"
+                  "     -c generator=[internal|libhooker|MobileSubstrate]\n"
+                  "     -c warnings=[default|error|none]\n"
+                  "  [-h|--help]\t\tDisplay this page")
+            sys.exit(0)
 
-    for cfg in args.config:
-        if '=' in cfg:
-            key, val = cfg.split('=', 1)
-            CONFIG[key] = val
+        for item in args.config:
+            if '=' in item:
+                key, value = item.split('=', 1)
+                cli_config[key] = value
+        source_path = args.filename
 
-    filename = args.filename
-    if not filename:
+    if not source_path:
         print(f"Usage: {script} [options] <filename>\n"
               f"Run {script} --help for more details", file=sys.stderr)
         sys.exit(1)
+
+    merged_config = dict(cli_config)
+    if config:
+        merged_config.update(config)
+    _reset_state(merged_config)
+    filename = str(source_path)
 
     try:
         with open(filename, 'r') as f:
@@ -1488,6 +1601,8 @@ def main():
 
     # Exit on warnings-as-errors
     if warnings_count > 0 and CONFIG.get('warnings') == 'error':
+        if _library_mode:
+            raise LogosError("logos: warnings were configured as errors")
         sys.exit(1)
 
     # Apply patches in reverse order
