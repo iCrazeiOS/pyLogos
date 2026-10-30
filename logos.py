@@ -13,7 +13,6 @@ import hashlib
 import argparse
 from contextlib import redirect_stdout
 from io import StringIO
-from pathlib import Path
 from threading import RLock
 from typing import Mapping, Optional, Union
 
@@ -385,12 +384,6 @@ def preprocess_file(
         LogosError: If Logos encounters an invalid directive or warnings are
             configured as errors.
     """
-    source_path = Path(path)
-    try:
-        source_path.read_text()
-    except OSError as exc:
-        raise FileNotFoundError(f"Could not open {source_path}.") from exc
-
     global _library_mode
     output = StringIO()
     # The parser still uses legacy module globals. Serialize public calls so
@@ -399,21 +392,52 @@ def preprocess_file(
         _library_mode = True
         try:
             with redirect_stdout(output):
-                main(str(source_path), config)
+                _process_file(path, config)
         finally:
             _library_mode = False
     return output.getvalue()
 
 
-def main(
-    source_path: Optional[Union[str, os.PathLike[str]]] = None,
-    config: Optional[Mapping[str, object]] = None,
-):
-    """Run the command-line-compatible processor or process one source path.
+def main():
+    """Command-line entry point."""
+    script = os.path.basename(__file__)
 
-    Called without arguments, this preserves the historical CLI behavior.
-    Supplying ``source_path`` is used by :func:`preprocess_file`; output is
-    still written to stdout so existing shell integrations remain compatible.
+    # ---- argument parsing --------------------------------------------------
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('-c', '--config', action='append', default=[])
+    parser.add_argument('-h', '--help', action='store_true', dest='show_help')
+    parser.add_argument('filename', nargs='?')
+    args = parser.parse_args()
+
+    if args.show_help:
+        print(f"Usage: {script} [options] <filename>\n"
+              "Options:\n"
+              "  [-c|--config]\t\tModify Logos' configuration "
+              "(MobileSubstrate, default)\n"
+              "     -c generator=[internal|libhooker|MobileSubstrate]\n"
+              "     -c warnings=[default|error|none]\n"
+              "  [-h|--help]\t\tDisplay this page")
+        sys.exit(0)
+
+    config = {}
+    for item in args.config:
+        if '=' in item:
+            key, value = item.split('=', 1)
+            config[key] = value
+
+    if not args.filename:
+        print(f"Usage: {script} [options] <filename>\n"
+              f"Run {script} --help for more details", file=sys.stderr)
+        sys.exit(1)
+
+    _process_file(args.filename, config)
+
+
+def _process_file(source_path, config=None):
+    """Translate ``source_path``, writing generated source to stdout.
+
+    Shared by :func:`main` and :func:`preprocess_file`; callers own argument
+    parsing and any output capture.
     """
     global CONFIG, warnings_count, filename, preprocessed
     global line_mapping, lines, patches
@@ -422,48 +446,15 @@ def main(
     global classes, nesting_stack, first_directive_position, last_init_position
     global depth_mapping, depth, lineno
 
-    script = os.path.basename(__file__)
-    cli_config = {}
-
-    if source_path is None:
-        # ---- argument parsing --------------------------------------------------
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument('-c', '--config', action='append', default=[])
-        parser.add_argument('-h', '--help', action='store_true', dest='show_help')
-        parser.add_argument('filename', nargs='?')
-        args = parser.parse_args()
-
-        if args.show_help:
-            print(f"Usage: {script} [options] <filename>\n"
-                  "Options:\n"
-                  "  [-c|--config]\t\tModify Logos' configuration "
-                  "(MobileSubstrate, default)\n"
-                  "     -c generator=[internal|libhooker|MobileSubstrate]\n"
-                  "     -c warnings=[default|error|none]\n"
-                  "  [-h|--help]\t\tDisplay this page")
-            sys.exit(0)
-
-        for item in args.config:
-            if '=' in item:
-                key, value = item.split('=', 1)
-                cli_config[key] = value
-        source_path = args.filename
-
-    if not source_path:
-        print(f"Usage: {script} [options] <filename>\n"
-              f"Run {script} --help for more details", file=sys.stderr)
-        sys.exit(1)
-
-    merged_config = dict(cli_config)
-    if config:
-        merged_config.update(config)
-    _reset_state(merged_config)
+    _reset_state(config)
     filename = str(source_path)
 
     try:
         with open(filename, 'r') as f:
             file_lines = f.readlines()
-    except IOError:
+    except IOError as exc:
+        if _library_mode:
+            raise FileNotFoundError(f"Could not open {filename}.") from exc
         print(f"Could not open {filename}.", file=sys.stderr)
         sys.exit(1)
 
